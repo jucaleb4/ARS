@@ -9,16 +9,15 @@ import parser
 import time
 import os
 import numpy as np
-import gym
+# import gym
+import gymnasium as gym
 import logz
-import ray
 import utils
 import optimizers
 from policies import *
 import socket
 from shared_noise import *
 
-@ray.remote
 class Worker(object):
     """ 
     Object class for parallel rollout generation.
@@ -33,7 +32,7 @@ class Worker(object):
 
         # initialize OpenAI environment for each worker
         self.env = gym.make(env_name)
-        self.env.seed(env_seed)
+        self.env_seed = env_seed
 
         # each worker gets access to the shared noise table
         # with independent random streams for sampling
@@ -69,10 +68,11 @@ class Worker(object):
         total_reward = 0.
         steps = 0
 
-        ob = self.env.reset()
+        ob, _ = self.env.reset(seed=self.env_seed)
         for i in range(rollout_length):
             action = self.policy.act(ob)
-            ob, reward, done, _ = self.env.step(action)
+            ob, reward, term, trunc, _ = self.env.step(action)
+            done = term or trunc
             steps += 1
             total_reward += (reward - shift)
             if done:
@@ -99,7 +99,7 @@ class Worker(object):
 
                 # for evaluation we do not shift the rewards (shift = 0) and we use the
                 # default rollout length (1000 for the MuJoCo locomotion tasks)
-                reward, r_steps = self.rollout(shift = 0., rollout_length = self.env.spec.timestep_limit)
+                reward, r_steps = self.rollout(shift = 0., rollout_length = self.env.spec.max_episode_steps)
                 rollout_rewards.append(reward)
                 
             else:
@@ -179,19 +179,19 @@ class ARSLearner(object):
         
         # create shared table for storing noise
         print("Creating deltas table.")
-        deltas_id = create_shared_noise.remote()
-        self.deltas = SharedNoiseTable(ray.get(deltas_id), seed = seed + 3)
+        deltas_id = create_shared_noise()
+        self.deltas = SharedNoiseTable(deltas_id, seed = seed + 3)
         print('Created deltas table.')
 
         # initialize workers with different random seeds
         print('Initializing workers.') 
         self.num_workers = num_workers
-        self.workers = [Worker.remote(seed + 7 * i,
-                                      env_name=env_name,
-                                      policy_params=policy_params,
-                                      deltas=deltas_id,
-                                      rollout_length=rollout_length,
-                                      delta_std=delta_std) for i in range(num_workers)]
+        self.workers = [Worker(seed + 7 * i,
+                               env_name=env_name,
+                               policy_params=policy_params,
+                               deltas=deltas_id,
+                               rollout_length=rollout_length,
+                               delta_std=delta_std) for i in range(num_workers)]
 
 
         # initialize policy 
@@ -215,26 +215,25 @@ class ARSLearner(object):
         else:
             num_deltas = num_rollouts
             
-        # put policy weights in the object store
-        policy_id = ray.put(self.w_policy)
-
         t1 = time.time()
         num_rollouts = int(num_deltas / self.num_workers)
             
         # parallel generation of rollouts
-        rollout_ids_one = [worker.do_rollouts.remote(policy_id,
-                                                 num_rollouts = num_rollouts,
-                                                 shift = self.shift,
-                                                 evaluate=evaluate) for worker in self.workers]
+        rollout_one = [worker.do_rollouts(self.w_policy,
+                                          num_rollouts = num_rollouts,
+                                          shift = self.shift,
+                                          evaluate=evaluate) 
+                       for worker in self.workers]
 
-        rollout_ids_two = [worker.do_rollouts.remote(policy_id,
-                                                 num_rollouts = 1,
-                                                 shift = self.shift,
-                                                 evaluate=evaluate) for worker in self.workers[:(num_deltas % self.num_workers)]]
+        rollout_two = [worker.do_rollouts(policy_id,
+                                          num_rollouts = 1,
+                                          shift = self.shift,
+                                          evaluate=evaluate) 
+                       for worker in self.workers[:(num_deltas % self.num_workers)]]
 
         # gather results 
-        results_one = ray.get(rollout_ids_one)
-        results_two = ray.get(rollout_ids_two)
+        results_one = rollout_one
+        results_two = rollout_two
 
         rollout_rewards, deltas_idx = [], [] 
 
@@ -310,8 +309,8 @@ class ARSLearner(object):
             if ((i + 1) % 10 == 0):
                 
                 rewards = self.aggregate_rollouts(num_rollouts = 100, evaluate = True)
-                w = ray.get(self.workers[0].get_weights_plus_stats.remote())
-                np.savez(self.logdir + "/lin_policy_plus", w)
+                # w = self.workers[0].get_weights_plus_stats()
+                # np.savez(self.logdir + "/lin_policy_plus", w)
                 
                 print(sorted(self.params.items()))
                 logz.log_tabular("Time", time.time() - start)
@@ -326,20 +325,17 @@ class ARSLearner(object):
             t1 = time.time()
             # get statistics from all workers
             for j in range(self.num_workers):
-                self.policy.observation_filter.update(ray.get(self.workers[j].get_filter.remote()))
+                self.policy.observation_filter.update(self.workers[j].get_filter())
             self.policy.observation_filter.stats_increment()
 
             # make sure master filter buffer is clear
             self.policy.observation_filter.clear_buffer()
             # sync all workers
-            filter_id = ray.put(self.policy.observation_filter)
-            setting_filters_ids = [worker.sync_filter.remote(filter_id) for worker in self.workers]
+            setting_filters_ids = [worker.sync_filter(self.policy.observation_filter) for worker in self.workers]
             # waiting for sync of all workers
-            ray.get(setting_filters_ids)
          
-            increment_filters_ids = [worker.stats_increment.remote() for worker in self.workers]
+            increment_filters_ids = [worker.stats_increment() for worker in self.workers]
             # waiting for increment of all workers
-            ray.get(increment_filters_ids)            
             t2 = time.time()
             print('Time to sync statistics:', t2 - t1)
                         
@@ -386,13 +382,13 @@ def run_ars(params):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env_name', type=str, default='HalfCheetah-v1')
+    parser.add_argument('--env_name', type=str, default='HalfCheetah-v4')
     parser.add_argument('--n_iter', '-n', type=int, default=1000)
     parser.add_argument('--n_directions', '-nd', type=int, default=8)
     parser.add_argument('--deltas_used', '-du', type=int, default=8)
     parser.add_argument('--step_size', '-s', type=float, default=0.02)
     parser.add_argument('--delta_std', '-std', type=float, default=.03)
-    parser.add_argument('--n_workers', '-e', type=int, default=18)
+    parser.add_argument('--n_workers', '-e', type=int, default=2)
     parser.add_argument('--rollout_length', '-r', type=int, default=1000)
 
     # for Swimmer-v1 and HalfCheetah-v1 use shift = 0
@@ -405,9 +401,6 @@ if __name__ == '__main__':
 
     # for ARS V1 use filter = 'NoFilter'
     parser.add_argument('--filter', type=str, default='MeanStdFilter')
-
-    local_ip = socket.gethostbyname(socket.gethostname())
-    ray.init(redis_address= local_ip + ':6379')
     
     args = parser.parse_args()
     params = vars(args)
